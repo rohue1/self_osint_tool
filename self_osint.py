@@ -25,6 +25,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -46,6 +47,20 @@ SF_HIGH = {"PHONE_NUMBER", "PHYSICAL_ADDRESS", "PASSWORD_COMPROMISED",
 
 
 # ---------------------------------------------------------------- helpers
+def recommended_action(category, risk):
+    if category == "Credentials/Breach":
+        return "Change affected passwords and enable MFA"
+    if category == "Location":
+        return "Remove GPS metadata before sharing"
+    if category == "Images":
+        return "Review and strip sensitive image metadata"
+    if category == "Old account":
+        return "Verify the account and close it if unused"
+    if risk == "H":
+        return "Review immediately"
+    return "Review and verify"
+
+
 def find_exe(*names):
     for n in names:
         path = shutil.which(n)
@@ -78,13 +93,31 @@ class Findings:
     def __init__(self):
         self.rows = []
         self.status = {}  # tool -> "ran" / "skipped: reason"
+        self._index = {}
 
     def add(self, tool, identifier, source, detail, category, risk):
-        self.rows.append(dict(tool=tool, identifier=identifier, source=source,
-                              detail=detail, category=category, risk=risk))
+        values = (identifier, source, detail, category)
+        key = tuple(str(value).strip().casefold() for value in values)
+        existing = self._index.get(key)
+        if existing:
+            tools = existing["tool"].split(", ")
+            if tool not in tools:
+                tools.append(tool)
+                existing["tool"] = ", ".join(tools)
+            if risk == "H" or (risk == "M" and existing["risk"] == "L"):
+                existing["risk"] = risk
+            return
+        row = dict(tool=tool, identifier=identifier, source=source,
+                   detail=detail, category=category, risk=risk)
+        self.rows.append(row)
+        self._index[key] = row
 
     def by_tool(self, tool):
-        return [r for r in self.rows if r["tool"] == tool]
+        return [r for r in self.rows if tool in r["tool"].split(", ")]
+
+    def by_tools(self, *tools):
+        return [r for r in self.rows
+                if any(tool in r["tool"].split(", ") for tool in tools)]
 
 
 # ---------------------------------------------------------------- usernames
@@ -280,11 +313,18 @@ BROKERS = ["spokeo.com", "whitepages.com", "beenverified.com", "fastpeoplesearch
 
 
 # ---------------------------------------------------------------- report
-def write_report(args, f, out_dir):
+def write_report(args, f, out_dir, metadata):
     rows = f.rows
     high = [r for r in rows if r["risk"] == "H"]
     L = []
-    L.append(f"# Self-OSINT Audit - {datetime.now():%Y-%m-%d %H:%M}\n")
+    L.append(f"# Self-OSINT Audit - {metadata['started_at']}\n")
+    L.append("## Scan metadata\n")
+    L.append(f"- Started: {metadata['started_at']}")
+    L.append(f"- Completed: {metadata['completed_at']}")
+    L.append(f"- Duration: {metadata['duration_seconds']:.1f} seconds")
+    L.append(f"- Python: {sys.version.split()[0]}")
+    L.append(f"- Findings after deduplication: {len(rows)}\n")
+
     L.append("## Identifiers searched\n")
     if args.name:
         L.append(f"- Name: {args.name}")
@@ -294,9 +334,8 @@ def write_report(args, f, out_dir):
 
     L.append("## Tool status\n")
     L.append("| Tool | Status | Findings |\n|---|---|---|")
-    counts = {"sherlock": "usernames", "maigret": "usernames"}
     for tool, st in f.status.items():
-        n = len(f.by_tool(counts.get(tool, tool)))
+        n = len(f.by_tool(tool))
         L.append(f"| {tool} | {st} | {n if st == 'ran' else '-'} |")
     L.append("")
 
@@ -305,14 +344,14 @@ def write_report(args, f, out_dir):
     L.append("")
 
     sections = [
-        ("usernames", "Accounts found by username (sherlock/maigret)"),
-        ("holehe", "Sites with an account registered to your emails (holehe)"),
-        ("hibp", "Breaches (HIBP)"),
-        ("exiftool", "Photo metadata (exiftool)"),
-        ("spiderfoot", "SpiderFoot passive results"),
+        (("sherlock", "maigret"), "Accounts found by username (sherlock/maigret)"),
+        (("holehe",), "Sites with an account registered to your emails (holehe)"),
+        (("hibp",), "Breaches (HIBP)"),
+        (("exiftool",), "Photo metadata (exiftool)"),
+        (("spiderfoot",), "SpiderFoot passive results"),
     ]
-    for key, title in sections:
-        items = f.by_tool(key)
+    for tools, title in sections:
+        items = f.by_tools(*tools)
         if not items:
             continue
         L.append(f"## {title} ({len(items)})\n")
@@ -334,11 +373,20 @@ def write_report(args, f, out_dir):
     (out_dir / "report.md").write_text("\n".join(L))
 
     with open(out_dir / "findings.csv", "w", newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=["tool", "identifier", "source", "detail",
-                                           "category", "risk", "action", "status"])
+        w = csv.DictWriter(
+            fh,
+            fieldnames=["tool", "identifier", "source", "detail", "category",
+                        "risk", "action", "status", "scan_started", "scan_completed"],
+        )
         w.writeheader()
         for r in rows:
-            w.writerow({**r, "action": "", "status": "open"})
+            w.writerow({
+                **r,
+                "action": recommended_action(r["category"], r["risk"]),
+                "status": "open",
+                "scan_started": metadata["started_at"],
+                "scan_completed": metadata["completed_at"],
+            })
 
 
 # ---------------------------------------------------------------- main
@@ -353,14 +401,21 @@ def main():
     ap.add_argument("--spiderfoot", action="store_true", help="also run SpiderFoot (slow)")
     ap.add_argument("--timeout", type=int, default=600, help="per-command timeout, seconds")
     ap.add_argument("--sf-timeout", type=int, default=1800, help="SpiderFoot timeout per target")
-    ap.add_argument("-o", "--out", default=f"osint_audit_{datetime.now():%Y%m%d_%H%M}")
+    ap.add_argument(
+        "-o", "--out", default="osint_audit",
+        help="output directory; repeated runs overwrite this run's report and raw logs",
+    )
     args = ap.parse_args()
 
     if not (args.name or args.username or args.email or args.images):
         ap.error("give at least one of --name, -u, -e, -i")
 
+    started_at = datetime.now().astimezone()
+    started_clock = time.monotonic()
     out_dir = Path(args.out)
     raw = out_dir / "raw"
+    if raw.exists():
+        shutil.rmtree(raw)
     raw.mkdir(parents=True, exist_ok=True)
     f = Findings()
 
@@ -381,7 +436,13 @@ def main():
         print(f"[*] {label} ...", flush=True)
         fn()
 
-    write_report(args, f, out_dir)
+    completed_at = datetime.now().astimezone()
+    metadata = {
+        "started_at": started_at.isoformat(timespec="seconds"),
+        "completed_at": completed_at.isoformat(timespec="seconds"),
+        "duration_seconds": time.monotonic() - started_clock,
+    }
+    write_report(args, f, out_dir, metadata)
     print(f"[+] {len(f.rows)} findings, "
           f"{sum(r['risk'] == 'H' for r in f.rows)} high-risk")
     print(f"[+] Report:   {out_dir / 'report.md'}")

@@ -1,0 +1,11 @@
+# Optional CLI tools used by self_osint.py
+sherlock-project
+maigret
+holehe
+
+# exiftool is a system executable and must be installed separately.
+# macOS: brew install exiftool
+# Debian/Ubuntu: sudo apt install libimage-exiftool-perl
+
+# SpiderFoot is a standalone application and must be installed separately:
+# git clone https://github.com/smicallef/spiderfoot.git
